@@ -10,8 +10,11 @@ mod contract_test_env;
 use contract_test_env::{
     register_creator_keys, register_test_creator, set_key_price_for_tests, test_env_with_auths,
 };
-use creator_keys::{constants, ContractError};
-use soroban_sdk::{testutils::Address as _, Address, Env};
+use creator_keys::{constants, events, ContractError};
+use soroban_sdk::{
+    testutils::{Address as _, Events},
+    Address, Env, IntoVal, Symbol,
+};
 
 const KEY_PRICE: i128 = 100;
 
@@ -57,7 +60,7 @@ fn test_buy_pushing_holder_above_cap_panics() {
     let result = client.try_buy_key(&creator, &buyer, &KEY_PRICE, &None);
     assert_eq!(
         result,
-        Ok(Err(ContractError::MaxHoldingExceeded)),
+        Err(Ok(ContractError::MaxHoldingExceeded)),
         "a buy past 10% of supply must be rejected"
     );
     assert_eq!(client.get_key_balance(&creator, &buyer), 2);
@@ -84,16 +87,14 @@ fn test_creator_wallet_is_exempt_from_cap() {
     let env = test_env_with_auths();
     let (client, creator) = setup(&env);
 
-    client.set_holder_cap(&creator, &Some(1000));
+    client.set_holder_cap(&creator, &None);
+    seed_creator_supply(&client, &creator, 9);
 
-    // The creator holds far more than 10% of a small supply.
-    seed_creator_supply(&client, &creator, 19);
-    assert_eq!(client.get_key_balance(&creator, &creator), 19);
-    assert_eq!(client.get_total_key_supply(&creator), 19);
-
-    // The exempt wallet can keep buying past the cap.
+    // Creator buys 2 keys (20% of new supply 11 > 10% cap).
     client.buy_key(&creator, &creator, &KEY_PRICE, &None);
-    assert_eq!(client.get_key_balance(&creator, &creator), 20);
+    client.buy_key(&creator, &creator, &KEY_PRICE, &None);
+    assert_eq!(client.get_key_balance(&creator, &creator), 11);
+    assert_eq!(client.get_total_key_supply(&creator), 11);
 }
 
 #[test]
@@ -120,10 +121,10 @@ fn test_set_holder_cap_rejects_values_outside_one_and_twenty_five_percent() {
     let (client, creator) = setup(&env);
 
     let too_small = client.try_set_holder_cap(&creator, &Some(99));
-    assert_eq!(too_small, Ok(Err(ContractError::InvalidHolderCap)));
+    assert_eq!(too_small, Err(Ok(ContractError::InvalidHolderCap)));
 
     let too_large = client.try_set_holder_cap(&creator, &Some(2501));
-    assert_eq!(too_large, Ok(Err(ContractError::InvalidHolderCap)));
+    assert_eq!(too_large, Err(Ok(ContractError::InvalidHolderCap)));
 
     assert_eq!(client.get_holder_cap(&creator), None);
 }
@@ -147,4 +148,88 @@ fn test_cap_is_stored_in_persistent_storage() {
         Some(1000),
         "cap must round-trip via persistent storage"
     );
+}
+
+#[test]
+fn test_update_holder_cap_reduces_cap_to_valid_lower_value() {
+    let env = test_env_with_auths();
+    let (client, creator) = setup(&env);
+
+    // Cap set to 25% at launch.
+    client.set_holder_cap(&creator, &Some(2500));
+    assert_eq!(client.get_holder_cap(&creator), Some(2500));
+
+    // Creator tightens the cap to 10% as the key grows.
+    client.update_holder_cap(&creator, &creator, &1000);
+    assert_eq!(client.get_holder_cap(&creator), Some(1000));
+}
+
+#[test]
+fn test_update_holder_cap_rejects_increase_above_current_cap() {
+    let env = test_env_with_auths();
+    let (client, creator) = setup(&env);
+
+    client.set_holder_cap(&creator, &Some(1000)); // 10%
+
+    let result = client.try_update_holder_cap(&creator, &creator, &2500); // 25% > current
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::CapCannotIncrease)),
+        "raising the cap above the stored value must be rejected"
+    );
+    // Cap must remain unchanged after a rejected increase.
+    assert_eq!(client.get_holder_cap(&creator), Some(1000));
+}
+
+#[test]
+fn test_update_holder_cap_rejects_below_minimum() {
+    let env = test_env_with_auths();
+    let (client, creator) = setup(&env);
+
+    client.set_holder_cap(&creator, &Some(1000));
+
+    let result = client.try_update_holder_cap(&creator, &creator, &99); // below 1% minimum
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::CapTooLow)),
+        "a cap below 100 bps must be rejected"
+    );
+    assert_eq!(client.get_holder_cap(&creator), Some(1000));
+}
+
+#[test]
+fn test_update_holder_cap_rejects_non_creator() {
+    let env = test_env_with_auths();
+    let (client, creator) = setup(&env);
+
+    client.set_holder_cap(&creator, &Some(1000));
+
+    let non_creator = Address::generate(&env);
+    let result = client.try_update_holder_cap(&non_creator, &creator, &500);
+    assert_eq!(
+        result,
+        Err(Ok(ContractError::Unauthorized)),
+        "only the key creator may tighten the cap"
+    );
+    assert_eq!(client.get_holder_cap(&creator), Some(1000));
+}
+
+#[test]
+fn test_update_holder_cap_emits_event_with_old_and_new_values() {
+    let env = test_env_with_auths();
+    let (client, creator) = setup(&env);
+
+    client.set_holder_cap(&creator, &Some(2000));
+
+    client.update_holder_cap(&creator, &creator, &1000);
+
+    let event_log = env.events().all();
+    let (_, topics, data) = event_log.last().expect("an event should be emitted");
+    let event_name: Symbol = topics.get(0).expect("topic").into_val(&env);
+    assert_eq!(event_name, events::HOLDER_CAP_UPDATED_EVENT_NAME);
+
+    let emitted_event: events::HolderCapUpdatedEvent = data.into_val(&env);
+    assert_eq!(emitted_event.key_id, creator);
+    assert_eq!(emitted_event.old_cap_bps, 2000);
+    assert_eq!(emitted_event.new_cap_bps, 1000);
 }
