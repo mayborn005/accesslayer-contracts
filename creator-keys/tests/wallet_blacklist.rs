@@ -10,7 +10,7 @@ use contract_test_env::{
     register_creator_keys, register_test_creator, set_key_price_for_tests, test_env_with_auths,
 };
 use creator_keys::{ContractError, RegisterCreatorParams};
-use soroban_sdk::{testutils::Address as _, Address, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, String};
 
 /// Register a protocol admin into contract storage and return the admin address.
 fn set_protocol_admin(
@@ -200,6 +200,9 @@ fn test_sell_key_succeeds_after_removal_from_blacklist() {
     client.blacklist_wallet(&admin, &seller);
     client.remove_from_blacklist(&admin, &seller);
 
+    let mut l = env.ledger().get();
+    l.sequence_number += 1;
+    env.ledger().set(l);
     let supply = client.sell_key(&creator, &seller, &None);
     assert_eq!(supply, 0);
     assert_eq!(client.get_key_balance(&creator, &seller), 0);
@@ -298,4 +301,43 @@ fn test_blacklist_does_not_affect_other_wallets() {
     let supply = client.buy_key(&creator, &allowed_buyer, &100, &None);
     assert_eq!(supply, 1);
     assert_eq!(client.get_key_balance(&creator, &allowed_buyer), 1);
+}
+
+// ---------------------------------------------------------------------------
+// is_wallet_blacklisted view returns correct status
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_is_wallet_blacklisted_returns_false_for_non_blacklisted_wallet() {
+    let env = test_env_with_auths();
+    let (client, _) = register_creator_keys(&env);
+    set_protocol_admin(&env, &client);
+
+    let wallet = Address::generate(&env);
+    assert!(!client.is_wallet_blacklisted(&wallet));
+}
+
+#[test]
+fn test_is_wallet_blacklisted_returns_true_after_blacklist() {
+    let env = test_env_with_auths();
+    let (client, _) = register_creator_keys(&env);
+    let admin = set_protocol_admin(&env, &client);
+
+    let wallet = Address::generate(&env);
+    client.blacklist_wallet(&admin, &wallet);
+    assert!(client.is_wallet_blacklisted(&wallet));
+}
+
+#[test]
+fn test_is_wallet_blacklisted_returns_false_after_removal() {
+    let env = test_env_with_auths();
+    let (client, _) = register_creator_keys(&env);
+    let admin = set_protocol_admin(&env, &client);
+
+    let wallet = Address::generate(&env);
+    client.blacklist_wallet(&admin, &wallet);
+    assert!(client.is_wallet_blacklisted(&wallet));
+
+    client.remove_from_blacklist(&admin, &wallet);
+    assert!(!client.is_wallet_blacklisted(&wallet));
 }
